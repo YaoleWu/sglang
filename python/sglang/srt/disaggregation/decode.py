@@ -97,6 +97,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
+
+from sglang.srt.mem_cache.cache_write_usage import (
+    PD_SNAPSHOT_CARRIED,
+    PD_SNAPSHOT_MAX_RANGES,
+)  # noqa: E402
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
     kv_private_window_tokens,
@@ -3534,6 +3539,24 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.mm_audio_tokens = cached_tokens[5].item()
         decode_req.req.mm_video_tokens = cached_tokens[6].item()
         decode_req.req.mm_token_counts_ready = True
+        # Slots 7-15: prefill measured cache-write snapshot (see
+        # MetadataBuffers.set_buf). Validation happens when the decode cache
+        # builds the request's usage; a zero flag leaves the request unknown.
+        snapshot_flag = int(cached_tokens[7].item())
+        if snapshot_flag == PD_SNAPSHOT_CARRIED:
+            snapshot_total = int(cached_tokens[8].item())
+            snapshot_ranges = [
+                (
+                    int(cached_tokens[9 + 2 * i].item()),
+                    int(cached_tokens[10 + 2 * i].item()),
+                )
+                for i in range(PD_SNAPSHOT_MAX_RANGES)
+            ]
+            decode_req.req._pd_cache_write_snapshot = (
+                snapshot_flag,
+                snapshot_total,
+                snapshot_ranges,
+            )
         if not self.spec_algorithm.is_none():
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index

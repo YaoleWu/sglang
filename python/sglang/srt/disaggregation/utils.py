@@ -26,6 +26,11 @@ from typing import (
 import msgspec
 import numpy as np
 import torch
+
+from sglang.srt.mem_cache.cache_write_usage import (
+    PD_SNAPSHOT_MAX_RANGES,
+    export_pd_cache_write_snapshot,
+)  # noqa: E402
 import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
@@ -924,6 +929,22 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][4] = image_t
         self.cached_tokens[req.metadata_buffer_index][5] = audio_t
         self.cached_tokens[req.metadata_buffer_index][6] = video_t
+        # Slots 7-15 carry the prefill-side measured cache-write snapshot
+        # (#48300): 7 = carried flag (0 = not carried, 1 = measured), 8 =
+        # total measured tokens, 9-14 = up to three (start, end) pairs net
+        # of the prefill's own cached reads, 15 spare. Legacy decode sides
+        # ignore spare slots; a zero flag reads as unknown, not as a
+        # measured zero.
+        flag, total, ranges = export_pd_cache_write_snapshot(
+            getattr(req, "_cache_write_usage", None)
+        )
+        row = self.cached_tokens[req.metadata_buffer_index]
+        row[7] = flag
+        row[8] = total
+        for i in range(PD_SNAPSHOT_MAX_RANGES):
+            start, end = ranges[i] if i < len(ranges) else (0, 0)
+            row[9 + 2 * i] = start
+            row[10 + 2 * i] = end
         if req.return_logprob:
             if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (

@@ -142,3 +142,78 @@ def cache_write_usage_for_req(req) -> CacheWriteUsage:
     else:
         usage.sync_prompt_tokens(len(req.origin_input_ids))
     return usage
+
+
+PD_SNAPSHOT_MAX_RANGES = 3
+PD_SNAPSHOT_CARRIED = 1
+PD_SNAPSHOT_NOT_CARRIED = 0
+
+
+def export_pd_cache_write_snapshot(
+    usage: "CacheWriteUsage",
+) -> tuple[int, int, list[tuple[int, int]]]:
+    """Bound the measured write ranges for the PD metadata carrier.
+
+    Returns (flag, total, ranges). ``flag == 0`` means "not carried": an
+    unsupported path must not masquerade as a measured zero. Exported ranges
+    are already net of the prefill's own cached reads and clipped to the
+    public prompt window, so the receiver needs no prefill coordinate space.
+    """
+    if usage is None or usage._supported is not True:
+        # No meter at the send boundary: the request was never measured.
+        return (PD_SNAPSHOT_NOT_CARRIED, 0, [])
+    upper = usage.reported_prompt_tokens
+    clipped = []
+    for start, end in usage._reusable:
+        start = max(start, usage._cached_prefix_len)
+        end = min(end, upper)
+        if start < end:
+            clipped.append((start, end))
+    if len(clipped) > PD_SNAPSHOT_MAX_RANGES:
+        # A bounded carrier cannot represent this coverage; keep the
+        # request unknown rather than publishing a partial measurement.
+        return (PD_SNAPSHOT_NOT_CARRIED, 0, [])
+    return (
+        PD_SNAPSHOT_CARRIED,
+        sum(end - start for start, end in clipped),
+        clipped,
+    )
+
+
+def import_pd_cache_write_snapshot(
+    usage: "CacheWriteUsage",
+    flag: int,
+    total: int,
+    ranges: list[tuple[int, int]],
+    prompt_tokens: int,
+) -> bool:
+    """Validate a transported snapshot and adopt it as this request's write.
+
+    Returns True when the request is measured. Overlapping decode-side
+    adoptions merge by union in :meth:`CacheWriteUsage.record`, so a decode
+    cache that re-adopts transferred ranges cannot double count.
+    """
+    if flag != PD_SNAPSHOT_CARRIED:
+        return False
+    if not isinstance(total, int) or isinstance(total, bool) or total < 0:
+        return False
+    if len(ranges) > PD_SNAPSHOT_MAX_RANGES:
+        return False
+    if not ranges and total != 0:
+        return False
+    checked: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if not isinstance(start, int) or not isinstance(end, int):
+            return False
+        if isinstance(start, bool) or isinstance(end, bool):
+            return False
+        if not 0 <= start < end <= prompt_tokens:
+            return False
+        checked.append((start, end))
+    if sum(end - start for start, end in checked) != total:
+        return False
+    usage.mark_supported()
+    # Exported ranges are net of prefill reads; the decode-side read boundary
+    # is applied by later record() calls through the existing max() fence.
+    usage.record(checked, reusable_prefix_len=max(0, prompt_tokens))
+    return True

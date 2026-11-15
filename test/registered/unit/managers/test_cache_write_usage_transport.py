@@ -53,6 +53,12 @@ from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
+from sglang.srt.disaggregation.utils import MetadataBuffers  # noqa: E402
+from sglang.srt.mem_cache.cache_write_usage import (  # noqa: E402
+    CacheWriteUsage,
+    export_pd_cache_write_snapshot,
+    import_pd_cache_write_snapshot,
+)
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -226,6 +232,136 @@ class TestCacheWriteTransport(CacheWriteTransportTestCase):
         self.assertEqual(
             [x.request_stats[0].cached_tokens for x in snapshots], [4, 4, 4]
         )
+
+
+class TestCacheWritePDTransport(CacheWriteTransportTestCase):
+    """The prefill snapshot must survive the real metadata carrier (#48300).
+
+    The carrier is the spare slot range of the existing cached_tokens buffer,
+    following the same packing convention as the multimodal token counts.
+    """
+
+    @staticmethod
+    def _prefill_usage(prompt_tokens, adopted):
+        usage = CacheWriteUsage(prompt_tokens)
+        usage.mark_supported()
+        for start, end in adopted:
+            # Disjoint, non-adjacent ranges: the meter merges adjacent ones,
+            # so each chunk here stays a separate carrier entry.
+            usage.record([(start, end)], reusable_prefix_len=prompt_tokens)
+        return usage
+
+    def test_prefill_snapshot_round_trip_through_slot_encoding(self):
+        import torch
+
+        adopted = [(0, 24), (30, 46), (50, 58)]
+        prefill = self._prefill_usage(64, adopted)
+        self.assertEqual(prefill.tokens, 48)
+        flag, total, ranges = export_pd_cache_write_snapshot(prefill)
+        self.assertEqual(flag, 1)
+        self.assertEqual(total, 48)
+        self.assertEqual(ranges, adopted)
+
+        buffers = MetadataBuffers(
+            size=4,
+            hidden_size=8,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=4,
+        )
+        req = SimpleNamespace(
+            metadata_buffer_index=2,
+            output_ids=[7],
+            origin_input_ids=list(range(64)),
+            cached_tokens=5,
+            cached_tokens_device=5,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
+            return_logprob=False,
+            return_sampling_mask=False,
+            hidden_states_tensor=None,
+            bootstrap_room=None,
+            customized_info=None,
+        )
+        req._cache_write_usage = prefill
+        buffers.set_buf(req)
+        row = buffers.cached_tokens[2]
+        self.assertEqual(int(row[7]), 1)
+        self.assertEqual(int(row[8]), 48)
+        self.assertEqual(
+            [
+                (int(row[9]), int(row[10])),
+                (int(row[11]), int(row[12])),
+                (int(row[13]), int(row[14])),
+            ],
+            ranges,
+        )
+
+        # The decode side reads the same row shape the commit path uses.
+        decode_usage = CacheWriteUsage(64)
+        self.assertTrue(
+            import_pd_cache_write_snapshot(
+                decode_usage,
+                int(row[7].item()),
+                int(row[8].item()),
+                [
+                    (int(row[9 + 2 * i].item()), int(row[10 + 2 * i].item()))
+                    for i in range(3)
+                ],
+                64,
+            )
+        )
+        self.assertEqual(decode_usage.tokens, prefill.tokens)
+
+    def test_decode_re_adopting_transferred_ranges_cannot_double_count(self):
+        adopted = [(0, 24), (30, 46)]
+        prefill = self._prefill_usage(64, adopted)
+        flag, total, ranges = export_pd_cache_write_snapshot(prefill)
+        decode_usage = CacheWriteUsage(64)
+        self.assertTrue(
+            import_pd_cache_write_snapshot(decode_usage, flag, total, ranges, 64)
+        )
+        # A decode radix cache that re-adopts exactly the transferred
+        # coverage unions into the existing ranges instead of summing again.
+        decode_usage.record(adopted, reusable_prefix_len=64)
+        self.assertEqual(decode_usage.tokens, 40)
+
+    def test_unsupported_and_oversized_snapshots_stay_not_carried(self):
+        unsupported = CacheWriteUsage(64)
+        unsupported.mark_unknown()
+        self.assertEqual(export_pd_cache_write_snapshot(unsupported), (0, 0, []))
+        never_started = CacheWriteUsage(64)
+        self.assertEqual(export_pd_cache_write_snapshot(never_started), (0, 0, []))
+        wide = self._prefill_usage(400, [(0, 50), (100, 150), (200, 250), (300, 350)])
+        self.assertEqual(export_pd_cache_write_snapshot(wide), (0, 0, []))
+
+    def test_invalid_carried_snapshots_are_rejected_as_unknown(self):
+        cases = [
+            (0, 0, []),  # legacy prefill: not carried
+            (1, 5, [(0, 4)]),  # total disagrees with ranges
+            (1, 20, [(60, 80)]),  # pair ends past the prompt window
+            (1, 4, [(4, 4)]),  # empty pair
+            (1, 4, [(8, 4)]),  # inverted pair
+        ]
+        for flag, total, ranges in cases:
+            with self.subTest(flag=flag, total=total, ranges=ranges):
+                usage = CacheWriteUsage(64)
+                self.assertFalse(
+                    import_pd_cache_write_snapshot(usage, flag, total, ranges, 64)
+                )
+                self.assertIsNone(usage.tokens)
+
+    def test_warm_duplicate_and_measured_zero_survive_the_handoff(self):
+        warm = self._prefill_usage(64, [(0, 16)])
+        warm.record([(0, 16)], reusable_prefix_len=64, cached_prefix_len=16)
+        self.assertEqual(warm.tokens, 0)
+        flag, total, ranges = export_pd_cache_write_snapshot(warm)
+        self.assertEqual((flag, total, ranges), (1, 0, []))
+        decode_usage = CacheWriteUsage(64)
+        self.assertTrue(
+            import_pd_cache_write_snapshot(decode_usage, flag, total, ranges, 64)
+        )
+        self.assertEqual(decode_usage.tokens, 0)
 
 
 class TestCacheWriteNativeMetadata(

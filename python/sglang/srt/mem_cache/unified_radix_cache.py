@@ -61,7 +61,10 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
-from sglang.srt.mem_cache.cache_write_usage import cache_write_usage_for_req
+from sglang.srt.mem_cache.cache_write_usage import (
+    cache_write_usage_for_req,
+    import_pd_cache_write_snapshot,
+)
 from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
@@ -1541,9 +1544,18 @@ class UnifiedRadixCache(BasePrefixCache):
         elif req.session is not None or req.session_id is not None:
             usage.mark_unknown()
         elif get_disagg().disaggregation_mode == "decode":
-            # The decode response does not receive the prefill worker's write
-            # count, even when the local radix cache is disabled.
-            usage.mark_unknown()
+            # A transported prefill snapshot (#48300) makes the request
+            # measured; legacy or invalid snapshots stay unknown, including
+            # with the local radix cache disabled.
+            snapshot = getattr(req, "_pd_cache_write_snapshot", None)
+            if not import_pd_cache_write_snapshot(
+                usage,
+                snapshot[0] if snapshot else 0,
+                snapshot[1] if snapshot else 0,
+                snapshot[2] if snapshot else [],
+                len(req.origin_input_ids),
+            ):
+                usage.mark_unknown()
         elif self.disable:
             usage.mark_supported()
         elif (
