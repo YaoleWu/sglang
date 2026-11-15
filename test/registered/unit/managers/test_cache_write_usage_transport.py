@@ -313,6 +313,54 @@ class TestCacheWritePDTransport(CacheWriteTransportTestCase):
         )
         self.assertEqual(decode_usage.tokens, prefill.tokens)
 
+    def test_padded_carrier_slots_do_not_reject_partial_coverage(self):
+        import torch
+
+        prefill = self._prefill_usage(64, [(10, 28), (40, 58)])
+        flag, total, ranges = export_pd_cache_write_snapshot(prefill)
+        self.assertEqual((flag, total, ranges), (1, 36, [(10, 28), (40, 58)]))
+
+        buffers = MetadataBuffers(
+            size=2,
+            hidden_size=8,
+            hidden_states_dtype=torch.float32,
+            max_sampling_mask_tokens=4,
+        )
+        req = SimpleNamespace(
+            metadata_buffer_index=1,
+            output_ids=[7],
+            origin_input_ids=list(range(64)),
+            cached_tokens=0,
+            cached_tokens_device=0,
+            cached_tokens_host=0,
+            cached_tokens_storage=0,
+            get_mm_token_counts=lambda: (0, 0, 0),
+            return_logprob=False,
+            return_sampling_mask=False,
+            hidden_states_tensor=None,
+            bootstrap_room=None,
+            customized_info=None,
+        )
+        req._cache_write_usage = prefill
+        buffers.set_buf(req)
+        row = buffers.cached_tokens[1]
+        # The receiver reads all carrier slots; the padded (0, 0) pair must be
+        # dropped before validation instead of rejecting the whole snapshot.
+        parsed = []
+        for i in range(3):
+            start = int(row[9 + 2 * i].item())
+            end = int(row[10 + 2 * i].item())
+            if start < end:
+                parsed.append((start, end))
+        self.assertEqual(parsed, ranges)
+        decode_usage = CacheWriteUsage(64)
+        self.assertTrue(
+            import_pd_cache_write_snapshot(
+                decode_usage, int(row[7].item()), int(row[8].item()), parsed, 64
+            )
+        )
+        self.assertEqual(decode_usage.tokens, 36)
+
     def test_decode_re_adopting_transferred_ranges_cannot_double_count(self):
         adopted = [(0, 24), (30, 46)]
         prefill = self._prefill_usage(64, adopted)

@@ -3545,13 +3545,14 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         snapshot_flag = int(cached_tokens[7].item())
         if snapshot_flag == PD_SNAPSHOT_CARRIED:
             snapshot_total = int(cached_tokens[8].item())
-            snapshot_ranges = [
-                (
-                    int(cached_tokens[9 + 2 * i].item()),
-                    int(cached_tokens[10 + 2 * i].item()),
-                )
-                for i in range(PD_SNAPSHOT_MAX_RANGES)
-            ]
+            # Unused carrier slots are padded with (0, 0); export never emits
+            # an empty range, so a zero-length pair is padding, not coverage.
+            snapshot_ranges = []
+            for i in range(PD_SNAPSHOT_MAX_RANGES):
+                start = int(cached_tokens[9 + 2 * i].item())
+                end = int(cached_tokens[10 + 2 * i].item())
+                if start < end:
+                    snapshot_ranges.append((start, end))
             decode_req.req._pd_cache_write_snapshot = (
                 snapshot_flag,
                 snapshot_total,
