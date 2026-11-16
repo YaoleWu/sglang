@@ -191,6 +191,17 @@ class _DeviceRows:
         self.ids = ids
 
 
+def tail_transfer_input_len(prompt_len: int, tail_tokens: int) -> int:
+    """KV transfer length for decode-tail mode: [0, N - W), never empty.
+
+    The decode worker recomputes the last W prompt tokens from a real extend,
+    so the transfer stops at N - W. At least one token always transfers so the
+    receiver's completion machinery sees a real KV chunk (a true
+    metadata-only handoff for N <= W is a later phase).
+    """
+    return max(1, prompt_len - min(tail_tokens, prompt_len - 1))
+
+
 def _rows_on_host(payload):
     if isinstance(payload, list):
         return [_rows_on_host(part) for part in payload]
