@@ -1,0 +1,37 @@
+name: Retirement receipt native api.v1 integration
+on:
+  push:
+    branches: [yaole/verify-retirement-integration-20261121]
+permissions:
+  contents: read
+jobs:
+  native-retirement:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev cmake nasm
+      - name: Install repository-pinned Rust and protoc
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+      - name: Restore native Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          shared-key: retirement-native-review
+          save-if: false
+      - name: Verify exact integration source and exercise native retirement routes
+        working-directory: rust
+        run: |
+          test "$(git rev-parse HEAD^)" = '7d7a795d692adebb2a01e9b20d894ec794cc4252'
+          git rev-parse HEAD HEAD^ HEAD:rust
+          git diff --exit-code HEAD^ HEAD -- ../python ../proto ../test .
+          rustc --version
+          cargo test --locked -p sglang-server --lib retirement -- --nocapture
