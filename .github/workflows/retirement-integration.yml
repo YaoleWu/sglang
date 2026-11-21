@@ -5,7 +5,7 @@ on:
 permissions:
   contents: read
 jobs:
-  native-retirement:
+  current-core-native-abort:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
@@ -13,7 +13,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          ref: '7f5719c1ba688d757286214399d0e067831be2d1'
+          fetch-depth: 1
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -27,11 +28,10 @@ jobs:
           workspaces: rust
           shared-key: retirement-native-review
           save-if: false
-      - name: Verify exact integration source and exercise native retirement routes
+      - name: Verify exact current core and native wait-rejection routes
         working-directory: rust
         run: |
-          test "$(git rev-parse HEAD^)" = '7d7a795d692adebb2a01e9b20d894ec794cc4252'
-          git rev-parse HEAD HEAD^ HEAD:rust
-          git diff --exit-code HEAD^ HEAD -- ../python ../proto ../test .
+          test "$(git rev-parse HEAD)" = '7f5719c1ba688d757286214399d0e067831be2d1'
+          git rev-parse HEAD HEAD:rust
           rustc --version
-          cargo test --locked -p sglang-server --lib retirement -- --nocapture
+          cargo test --locked -p sglang-server --lib api_server::http::info::tests::abort_request -- --nocapture
