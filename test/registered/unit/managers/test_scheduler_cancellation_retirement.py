@@ -350,7 +350,14 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         move([neighbor], scheduler.waiting_queue)
         explicit = msgpack_decode(
             msgspec.msgpack.encode(
-                ["CancellationRetirementReq", "corr", None, "explicit-empty", "corr", ""]
+                [
+                    "CancellationRetirementReq",
+                    "corr",
+                    None,
+                    "explicit-empty",
+                    "corr",
+                    "",
+                ]
             )
         )
         scheduler.handle_cancellation_retirement(explicit)
