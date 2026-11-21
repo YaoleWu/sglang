@@ -6,6 +6,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -300,6 +301,72 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertFalse(req.finished())
         self.assertTrue(req.kv.holds_kv)
 
+    def test_retirement_ipc_separates_control_rid_from_target_rid(self):
+        """Native control callers route receipts on a new RID, not the generation RID."""
+        scheduler = self._scheduler()
+        target = self._req(scheduler, "internal-rid", "internal-rid")
+        neighbor = self._req(scheduler, "corr", "corr")
+        move([target, neighbor], scheduler.waiting_queue)
+
+        # The native Rust caller in #50042 sends this six-element tagged array.
+        def send(correlation_rid):
+            control = msgpack_decode(
+                msgspec.msgpack.encode(
+                    [
+                        "CancellationRetirementReq",
+                        correlation_rid,
+                        None,
+                        "rust-op",
+                        "internal-rid",
+                        "internal-rid",
+                    ]
+                )
+            )
+            scheduler.handle_cancellation_retirement(control)
+
+        send("corr")
+        send("retry-corr")
+        self.assertEqual(
+            [(out.rid, out.status) for out, _ in self.outputs],
+            [("corr", "retired"), ("retry-corr", "retired")],
+        )
+        self.assertTrue(target.kv.is_kv_released)
+        self.assertTrue(neighbor.kv.holds_kv)
+
+        # The former five-element layout must still target its original RID.
+        legacy = msgpack_decode(
+            msgspec.msgpack.encode(
+                ["CancellationRetirementReq", "corr", None, "legacy-op", "corr"]
+            )
+        )
+        scheduler.handle_cancellation_retirement(legacy)
+        self.assertEqual(self.outputs[-1][0].status, "retired")
+        self.assertTrue(neighbor.kv.is_kv_released)
+
+    def test_explicit_target_never_falls_back_to_control_correlation(self):
+        """An explicit empty target is invalid, not a legacy omitted target."""
+        scheduler = self._scheduler()
+        neighbor = self._req(scheduler, "corr", "corr")
+        move([neighbor], scheduler.waiting_queue)
+        explicit = msgpack_decode(
+            msgspec.msgpack.encode(
+                ["CancellationRetirementReq", "corr", None, "explicit-empty", "corr", ""]
+            )
+        )
+        scheduler.handle_cancellation_retirement(explicit)
+        self.assertEqual(self.outputs[-1][0].rid, "corr")
+        self.assertEqual(self.outputs[-1][0].status, "unknown")
+        self.assertTrue(neighbor.kv.holds_kv)
+        self.assertIn(neighbor, scheduler.waiting_queue)
+        legacy = msgpack_decode(
+            msgspec.msgpack.encode(
+                ["CancellationRetirementReq", "corr", None, "legacy", "corr"]
+            )
+        )
+        scheduler.handle_cancellation_retirement(legacy)
+        self.assertEqual(self.outputs[-1][0].status, "retired")
+        self.assertTrue(neighbor.kv.is_kv_released)
+
     def test_unsupported_topology_and_grammar_queue_leave_request_untouched(self):
         scheduler = self._scheduler()
         req = self._req(scheduler)
@@ -391,6 +458,15 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         entry = scheduler._cancellation_retirements[control.cancellation_id]
         self.assertEqual(entry.status, "retired")
         self.assertEqual(len(entry.replies), 1)
+
+        with patch(
+            "sglang.srt.managers.scheduler.CANCELLATION_RETIREMENT_MAX_ENTRIES", 1
+        ):
+            self._cancel(scheduler, req, "overflow")
+        self.assertEqual(self.outputs.pop()[0].reason, "receipt_capacity")
+        self.assertIs(
+            scheduler._cancellation_retirements[control.cancellation_id], entry
+        )
 
         entry.next_retry_at = 0.0
         scheduler._check_cancellation_retirements()

@@ -3437,7 +3437,7 @@ class Scheduler(
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
                 kv_hints=recv_req.kv_hints,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
                     self.metrics_collector
@@ -3493,7 +3493,7 @@ class Scheduler(
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
-                self.model_config.vocab_size,
+                self.model_config.token_id_vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
@@ -3524,7 +3524,7 @@ class Scheduler(
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                vocab_size=self.model_config.vocab_size,
+                vocab_size=self.model_config.token_id_vocab_size,
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
@@ -6777,7 +6777,9 @@ class Scheduler(
             entries = self._cancellation_retirements = {}
         # rid remains the control-reply correlation id; target_rid (or rid for
         # HTTP) is the generation identity used for lookup and the registry.
-        target_rid = recv_req.target_rid or recv_req.rid
+        target_rid = (
+            recv_req.rid if recv_req.target_rid is None else recv_req.target_rid
+        )
         if (entry := entries.get(recv_req.cancellation_id)) is not None:
             if (entry.rid, entry.request_instance_id) != (
                 target_rid,
@@ -6801,17 +6803,9 @@ class Scheduler(
                 )
             return
         if len(entries) >= CANCELLATION_RETIREMENT_MAX_ENTRIES:
-            # Completed entries own no resources and can yield room for a new
-            # operation. Never evict an outstanding request's observation.
-            completed = next(
-                (key for key, value in entries.items() if value.status), None
-            )
-            if completed is None:
-                self._reply_cancellation_retirement(
-                    recv_req, "unknown", "receipt_capacity"
-                )
-                return
-            del entries[completed]
+            # Preserve completed bindings and any pending receipt deliveries.
+            self._reply_cancellation_retirement(recv_req, "unknown", "receipt_capacity")
+            return
         entry = _CancellationRetirement(
             rid=target_rid,
             request_instance_id=recv_req.request_instance_id,
